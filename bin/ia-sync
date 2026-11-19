@@ -1,14 +1,51 @@
 #!/usr/bin/env python3
-"""ia-sync: mantém ~/.ia como fonte única de skills, agentes, instruções, MCPs e
-configs de IA, e liga (symlink) / gera os arquivos que cada ferramenta espera.
+"""ia-sync: uma pasta só (~/.ia) pra skills, agentes, instruções, MCPs e configs de todas as IAs.
+
+Fluxo de cada execução:
+  1. checagem   valida o que é do usuário (servers.json, estado) ANTES de mexer em qualquer coisa
+  2. importação traz pro ~/.ia o que estiver solto nas ferramentas (~/.claude, ~/.codex, ...)
+  3. padronização conserta frontmatter de skills e caminhos ~/.<ia>/skills/... -> ~/.ia/skills/...
+  4. sincronização liga (symlink) ou gera, no formato de cada ferramenta, o que está no ~/.ia
 
 Uso:
   ia-sync            importa o que estiver solto nas ferramentas e sincroniza tudo
-  ia-sync --dry-run  só mostra o que faria
+  ia-sync --dry-run  só mostra o que faria (não cria, move nem escreve nada)
   ia-sync --quiet    só imprime avisos/erros
   ia-sync status     mostra o estado de cada ferramenta
+
+Pasta das configs: $IA_HOME > pasta onde o script está instalado (<pasta>/bin/ia-sync) > ~/.ia.
+
+Segurança:
+  - segredos ficam só no secrets.env (0600); arquivos que recebem segredo já preenchido são gravados 0600;
+  - backups e conflitos ficam em pastas 0700, e o backup .tgz da 1ª execução é 0600;
+  - toda escrita é atômica (arquivo temporário + rename), então uma queda no meio não corrompe config;
+  - nada é apagado sem backup; arquivos do usuário inválidos são pulados, nunca "recriados".
+  Limitação conhecida: o Claude Code só aceita MCP via `claude mcp add-json <nome> <json>`, então o JSON
+  (com o segredo já preenchido) aparece por alguns milissegundos na lista de processos (ps).
 """
-import argparse, filecmp, hashlib, json, os, re, shutil, subprocess, sys, tarfile, time, tomllib
+from __future__ import annotations
+
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit(f"ia-sync precisa do Python 3.11+ (este é {sys.version.split()[0]})")
+
+import argparse
+import contextlib
+import fcntl
+import filecmp
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import time
+import tomllib
+import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
@@ -16,11 +53,17 @@ try:
 except ImportError:
     sys.exit("ia-sync precisa do PyYAML: sudo apt install python3-yaml  (ou pip install pyyaml)")
 
+VERSION = "1.2.0"
+
+
+# =============================================================================
+# Caminhos e constantes
+# =============================================================================
 HOME = Path.home()
 MARKER = ".ia-sync-home"  # marca a pasta escolhida na instalação
 
 
-def find_ia():
+def find_ia() -> Path:
     """Pasta das configs: $IA_HOME > pasta onde o script está instalado (<pasta>/bin/ia-sync) > ~/.ia."""
     if os.environ.get("IA_HOME"):
         return Path(os.environ["IA_HOME"]).expanduser().resolve()
@@ -31,54 +74,97 @@ def find_ia():
 
 
 IA = find_ia()
-SHOW = f"~/{IA.relative_to(HOME)}" if IA.is_relative_to(HOME) else str(IA)  # pra mensagens
-TS = time.strftime("%Y%m%d-%H%M%S")
-STATE_FILE = IA / ".state.json"
+TS = time.strftime("%Y%m%d-%H%M%S")  # carimbo desta execução (pastas de backup/conflito)
+STATE_FILE = IA / ".state.json"      # hashes dos gerados e MCPs gerenciados
+LOCK_FILE = IA / ".lock"
 SECRETS = IA / "secrets.env"
 MCP_FILE = IA / "mcp" / "servers.json"
 AGENTS_MD = IA / "AGENTS.md"
-IGNORED_SKILL_DIRS = {"synced", ".system"}  # gerenciadas pelo próprio fornecedor
+
+TOOL_IDS = ("claude", "codex", "copilot", "kiro", "gemini")
+IGNORED_SKILL_DIRS = {"synced", ".system"}                         # gerenciadas pelo fornecedor
+SKIP_WALK = {".git", "node_modules", "__pycache__", ".venv", "venv"}  # nunca reescrever lá dentro
+MAX_TEXT = 1_000_000                                               # não mexe em texto maior que 1 MB
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]*$")             # nome válido de MCP
+VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")             # ${VAR} no servers.json
+BLOCK_BEGIN = "# >>> ia-sync mcp"                                  # bloco gerado no config.toml do Codex
+BLOCK_END = "# <<< ia-sync mcp"
 
 DRY = QUIET = False
-changes, warnings = [], []
+changes: list[str] = []
+warnings: list[str] = []
 
 
-def info(msg):
+class Fatal(Exception):
+    """Erro que impede o sync de continuar com segurança (nada foi alterado)."""
+
+
+# =============================================================================
+# Saída
+# =============================================================================
+def show(p) -> str:
+    """Caminho curto pra mensagens e comentários (~/...), sem expor a home completa."""
+    p = Path(p)
+    try:
+        return "~/" + str(p.relative_to(HOME))
+    except ValueError:
+        return str(p)
+
+
+SHOW = show(IA)
+
+
+def info(msg: str) -> None:
     changes.append(msg)
     if not QUIET:
         print("  " + msg)
 
 
-def warn(msg):
+def warn(msg: str) -> None:
+    if msg in warnings:  # o mesmo aviso (ex.: variável faltando em 3 ferramentas) aparece uma vez só
+        return
     warnings.append(msg)
     print("  ⚠ " + msg, file=sys.stderr)
 
 
-# ---------------------------------------------------------------- ferramentas
-def tools():
-    """Ferramentas instaladas no WSL (só entram se o diretório home existir)."""
+# =============================================================================
+# Ferramentas suportadas
+# =============================================================================
+@dataclass
+class Tool:
+    """Onde cada coisa fica numa ferramenta. Campos None = a ferramenta não tem aquilo."""
+    id: str
+    home: Path
+    skills: Path | None = None
+    agents: Path | None = None
+    agents_fmt: str | None = None      # claude | codex | copilot | kiro
+    instructions: Path | None = None
+    mcp: str | None = None             # claude-cli | codex-toml | json (copilot/kiro/gemini)
+    mcp_file: Path | None = None
+    steering: Path | None = None       # só Kiro
+    settings: list[tuple[str, Path]] = field(default_factory=list)  # (caminho no ~/.ia, alvo na ferramenta)
+
+
+def tools() -> list[Tool]:
+    """Ferramentas instaladas (só entram se a pasta delas existir)."""
     t = []
     c = HOME / ".claude"
     if c.is_dir():
-        t.append(dict(id="claude", home=c, skills=c / "skills", agents=c / "agents", agents_fmt="claude",
-                      instructions=c / "CLAUDE.md", mcp="claude-cli",
+        t.append(Tool("claude", c, c / "skills", c / "agents", "claude", c / "CLAUDE.md", "claude-cli",
                       settings=[("settings/claude/settings.json", c / "settings.json")]))
     x = HOME / ".codex"
     if x.is_dir():
-        t.append(dict(id="codex", home=x, skills=x / "skills", agents=x / "agents", agents_fmt="codex",
-                      instructions=x / "AGENTS.md", mcp="codex-toml",
+        t.append(Tool("codex", x, x / "skills", x / "agents", "codex", x / "AGENTS.md", "codex-toml",
                       settings=[("settings/codex/config.toml", x / "config.toml")]))
     p = HOME / ".copilot"
     if p.is_dir():
-        t.append(dict(id="copilot", home=p, skills=p / "skills", agents=p / "agents", agents_fmt="copilot",
-                      instructions=p / "copilot-instructions.md", mcp="copilot-json", mcp_file=p / "mcp-config.json",
-                      settings=[("settings/copilot/config.json", p / "config.json")]))
+        t.append(Tool("copilot", p, p / "skills", p / "agents", "copilot", p / "copilot-instructions.md", "json",
+                      p / "mcp-config.json", settings=[("settings/copilot/config.json", p / "config.json")]))
     k = Path(os.environ.get("KIRO_HOME") or HOME / ".kiro")
     if k.is_dir():
-        ide = HOME / ".config" / "Kiro" / "User"  # Kiro IDE (servidor no WSL)
-        t.append(dict(id="kiro", home=k, skills=k / "skills", agents=k / "agents", agents_fmt="kiro",
-                      instructions=k / "steering" / "AGENTS.md", mcp="kiro-json", mcp_file=k / "settings" / "mcp.json",
-                      steering=k / "steering",
+        ide = HOME / ".config" / "Kiro" / "User"  # Kiro IDE (servidor no WSL/Linux)
+        t.append(Tool("kiro", k, k / "skills", k / "agents", "kiro", k / "steering" / "AGENTS.md", "json",
+                      k / "settings" / "mcp.json", steering=k / "steering",
                       settings=[("settings/kiro/cli.json", k / "settings" / "cli.json"),
                                 ("settings/kiro/permissions.yaml", k / "settings" / "permissions.yaml"),
                                 ("settings/kiro/sandbox.json", k / "settings" / "sandbox.json"),
@@ -89,77 +175,201 @@ def tools():
                                 ("settings/kiro/ide/keybindings.json", ide / "keybindings.json")]))
     g = HOME / ".gemini"
     if g.is_dir():
-        # o settings.json do Gemini guarda config e MCPs juntos: o arquivo vira link e o ia-sync
-        # só reescreve a chave "mcpServers" dentro dele.
-        t.append(dict(id="gemini", home=g, skills=g / "skills", agents=None, agents_fmt=None,
-                      instructions=g / "GEMINI.md", mcp="gemini-json", mcp_file=g / "settings.json",
-                      settings=[("settings/gemini/settings.json", g / "settings.json")]))
+        # o settings.json do Gemini guarda config e MCPs juntos: vira link e o ia-sync só reescreve "mcpServers"
+        t.append(Tool("gemini", g, g / "skills", instructions=g / "GEMINI.md", mcp="json",
+                      mcp_file=g / "settings.json", settings=[("settings/gemini/settings.json", g / "settings.json")]))
     return t
 
 
-def rel_home(p):
+def real_path(t: Tool, p: Path) -> Path:
+    """Se p é uma config que é (ou vai ser) link pro ~/.ia, devolve o arquivo canônico dentro do ~/.ia."""
+    for rel, target in t.settings:
+        if p == target and ((IA / rel).exists() or not target.exists()):
+            return IA / rel
+    return p
+
+
+# =============================================================================
+# Sistema de arquivos (tudo respeita --dry-run)
+# =============================================================================
+def rel_home(p) -> str:
+    """Caminho relativo à home, pra montar rótulos de backup (fora da home: caminho sem a / inicial)."""
     p = Path(p)
     try:
         return str(p.relative_to(HOME))
-    except ValueError:  # ex.: KIRO_HOME fora da home
+    except ValueError:
         return str(p).lstrip("/")
 
 
-def real_path(t, p):
-    """Se p é um config ligado ao ~/.ia (ou que vai ser), devolve o arquivo canônico."""
-    for rel, target in t.get("settings", []):
-        if Path(p) == target and ((IA / rel).exists() or not target.exists()):
-            return IA / rel
-    return Path(p)
+def ls(d) -> list[Path]:
+    d = Path(d)
+    return sorted(d.iterdir()) if d.is_dir() else []
 
 
-# ---------------------------------------------------------------- utilidades
-def load_state():
+def walk_files(root: Path):
+    """Arquivos de verdade dentro de root, sem seguir links e pulando .git, node_modules etc."""
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(n for n in dirnames if n not in SKIP_WALK)
+        for n in sorted(filenames):
+            f = Path(dirpath) / n
+            if f.is_file() and not f.is_symlink():
+                yield f
+
+
+def read_text(p) -> str | None:
+    """Lê texto UTF-8; devolve None (sem quebrar) se for binário ou ilegível."""
     try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return {"generated": {}, "mcp": {}}
+        return Path(p).read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return None
 
 
-def save_state(s):
+def umask() -> int:
+    m = os.umask(0)
+    os.umask(m)
+    return m
+
+
+def write_file(path, text: str, mode: int | None = None) -> None:
+    """Escrita atômica: grava num temporário na mesma pasta e troca (rename). Uma queda no meio nunca
+    deixa o arquivo pela metade. Escreve através de symlinks (no arquivo real). `mode` força a permissão;
+    sem ele, mantém a do arquivo existente."""
+    if DRY:
+        return
+    path = Path(path)
+    if path.is_symlink():
+        path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if mode is None:
+        mode = path.stat().st_mode & 0o7777 if path.exists() else 0o666 & ~umask()
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")  # nasce 0600
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+
+
+def private_dir(d: Path) -> Path:
+    """Pasta só do usuário (0700): backups e conflitos podem conter segredos."""
     if not DRY:
-        STATE_FILE.write_text(json.dumps(s, indent=2, sort_keys=True) + "\n")
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
+    return d
 
 
-def sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def unique(p: Path) -> Path:
+    """p, ou p-2, p-3... se já existir (backups no mesmo segundo não se sobrescrevem)."""
+    if not p.exists() and not p.is_symlink():
+        return p
+    n = 2
+    while (q := p.with_name(f"{p.name}-{n}")).exists() or q.is_symlink():
+        n += 1
+    return q
 
 
-def same(a, b):
-    a, b = Path(a), Path(b)
+def backup(path: Path, label: str) -> None:
+    """Tira path do lugar e guarda em _backup/<execução>/<label>."""
+    private_dir(IA / "_backup")
+    dest = unique(IA / "_backup" / TS / label)
+    info(f"backup {show(path)} -> {show(dest)}")
+    if not DRY:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(dest))
+
+
+def conflict(src: Path, label: str, text: str | None = None) -> Path:
+    """Guarda em _conflicts/ algo que diverge da versão do ~/.ia (move src, ou grava text)."""
+    private_dir(IA / "_conflicts")
+    dest = unique(IA / "_conflicts" / label / f"{src.name}-{TS}")
+    if not DRY:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if text is None:
+            shutil.move(str(src), str(dest))
+        else:
+            write_file(dest, text, 0o600)
+    return dest
+
+
+def link_target(p: Path) -> Path:
+    return Path(os.path.normpath(p.parent / os.readlink(p)))
+
+
+def points_into_ia(p) -> bool:
+    """p é um symlink apontando pra dentro do ~/.ia?"""
+    p = Path(p)
+    return p.is_symlink() and str(link_target(p)).startswith(str(IA) + os.sep)
+
+
+def symlink(src: Path, dst: Path) -> bool:
+    """Cria dst -> src. O que existir no lugar vai pro backup. Retorna True se mudou algo."""
+    if dst.is_symlink() and Path(os.readlink(dst)) == src:
+        return False
+    if dst.is_symlink():
+        if not DRY:
+            dst.unlink()
+    elif dst.exists():
+        backup(dst, f"replaced/{rel_home(dst)}")
+    info(f"link {show(dst)} -> {show(src)}")
+    if not DRY:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.symlink_to(src)
+    return True
+
+
+def managed_dir(d: Path | None, what: str) -> bool:
+    """Pode gerenciar a pasta d (skills/agents de uma ferramenta)? Se ela for link pro ~/.ia antigo
+    (pasta inteira), vira pasta normal; se for link pra OUTRO lugar (ex.: um repo seu), é respeitada."""
+    if not d:
+        return False
+    if d.is_symlink():
+        if points_into_ia(d):
+            info(f"{show(d)} era link da pasta inteira; agora é um link por item")
+            if not DRY:
+                d.unlink()
+            return True
+        warn(f"{show(d)} é link pra {show(link_target(d))}; {what} dessa ferramenta ficam de fora")
+        return False
+    return True
+
+
+def same(a: Path, b: Path) -> bool:
+    """Conteúdo idêntico (arquivo ou pasta inteira, byte a byte)."""
     if a.is_file() and b.is_file():
         return filecmp.cmp(a, b, shallow=False)
     if a.is_dir() and b.is_dir():
         d = filecmp.dircmp(a, b)
         if d.left_only or d.right_only or d.funny_files:
             return False
-        _, diff, err = filecmp.cmpfiles(a, b, d.common_files, shallow=False)  # dircmp sozinho compara só tamanho/data
-        if diff or err:
-            return False
-        return all(same(a / s, b / s) for s in d.common_dirs)
+        _, diff, err = filecmp.cmpfiles(a, b, d.common_files, shallow=False)  # dircmp sozinho olha só tamanho/data
+        return not diff and not err and all(same(a / s, b / s) for s in d.common_dirs)
     return False
 
 
-def same_normalized(a, b):
-    """Igual depois de padronizar (ex.: mesma skill no Claude e no Codex, cada uma com seu caminho)."""
-    a, b = Path(a), Path(b)
-    fa = {f.relative_to(a) for f in a.rglob("*") if f.is_file()} if a.is_dir() else {Path(".")}
-    fb = {f.relative_to(b) for f in b.rglob("*") if f.is_file()} if b.is_dir() else {Path(".")}
-    if fa != fb:
+def same_normalized(a: Path, b: Path) -> bool:
+    """Igual depois de padronizar (ex.: a mesma skill no Claude e no Codex, cada uma com o caminho da sua IA)."""
+    if a.is_dir() != b.is_dir():
         return False
-    for r in fa:
-        x, y = (a / r, b / r) if a.is_dir() else (a, b)
-        try:
-            tx, ty = fix_paths(x.read_text()), fix_paths(y.read_text())
-        except (UnicodeDecodeError, OSError):
+    if a.is_dir():
+        fa = {f.relative_to(a) for f in walk_files(a)}
+        if fa != {f.relative_to(b) for f in walk_files(b)}:
+            return False
+        pairs = [(a / r, b / r) for r in fa]
+    else:
+        pairs = [(a, b)]
+    for x, y in pairs:
+        tx, ty = read_text(x), read_text(y)
+        if tx is None or ty is None:
             if not filecmp.cmp(x, y, shallow=False):
                 return False
             continue
+        tx, ty = fix_paths(tx), fix_paths(ty)
         if x.name == "SKILL.md":
             tx, ty = fix_skill_front(tx, a.name)[0], fix_skill_front(ty, a.name)[0]
         if tx != ty:
@@ -167,168 +377,199 @@ def same_normalized(a, b):
     return True
 
 
-def backup(path, label):
-    dest = IA / "_backup" / TS / label
-    info(f"backup {path} -> {dest}")
-    if DRY:
-        return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(path), str(dest))
+# =============================================================================
+# Estado (.state.json)
+# =============================================================================
+def load_state() -> dict:
+    """Hashes dos arquivos gerados e MCPs que o ia-sync gerencia (pra saber o que remover depois)."""
+    try:
+        s = json.loads(STATE_FILE.read_text())
+    except FileNotFoundError:
+        s = {}
+    except (OSError, ValueError) as e:
+        raise Fatal(f"{show(STATE_FILE)} está corrompido ({e}); apague o arquivo e rode de novo")
+    if not isinstance(s, dict):
+        raise Fatal(f"{show(STATE_FILE)} está corrompido; apague o arquivo e rode de novo")
+    s.setdefault("generated", {})
+    s.setdefault("mcp", {})
+    return s
 
 
-def points_into_ia(p):
-    p = Path(p)
-    if not p.is_symlink():
-        return False
-    target = Path(os.path.normpath(p.parent / os.readlink(p)))
-    return str(target).startswith(str(IA) + os.sep)
+def save_state(s: dict) -> None:
+    write_file(STATE_FILE, json.dumps(s, indent=2, sort_keys=True) + "\n", 0o600)
 
 
-def symlink(src, dst):
-    """dst -> src. Retorna True se mudou algo."""
-    src, dst = Path(src), Path(dst)
-    if dst.is_symlink() and Path(os.readlink(dst)) == src:
-        return False
-    if dst.exists() or dst.is_symlink():
-        if dst.is_symlink():
-            if not DRY:
-                dst.unlink()
-        else:
-            backup(dst, f"replaced/{rel_home(dst)}")
-    info(f"link {dst} -> {src}")
-    if not DRY:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.symlink_to(src)
-    return True
-
-
-def write_generated(path, content, state):
-    """Escreve arquivo gerado; se alguém editou o gerado direto, faz backup antes."""
-    path = Path(path)
+def write_generated(path: Path, content: str, state: dict) -> None:
+    """Escreve um arquivo gerado. Se alguém editou o gerado direto, faz backup antes de sobrescrever."""
     key = str(path)
+    digest = hashlib.sha256(content.encode()).hexdigest()
     if path.is_symlink():
         if not DRY:
             path.unlink()
     elif path.exists():
-        cur = path.read_text()
+        cur = read_text(path)
         if cur == content:
-            state["generated"][key] = hashlib.sha256(content.encode()).hexdigest()
+            state["generated"][key] = digest
             return
-        if state["generated"].get(key) != sha(path):
-            warn(f"{path} foi editado fora do {SHOW}; backup feito antes de sobrescrever")
+        if state["generated"].get(key) != hashlib.sha256(path.read_bytes()).hexdigest():
+            warn(f"{show(path)} foi editado fora do {SHOW}; backup feito antes de sobrescrever")
             backup(path, f"edited/{rel_home(path)}")
-    info(f"gerado {path}")
-    if not DRY:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-    state["generated"][key] = hashlib.sha256(content.encode()).hexdigest()
+    info(f"gerado {show(path)}")
+    write_file(path, content)
+    state["generated"][key] = digest
 
 
-FRONT_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.S)
+# =============================================================================
+# Formatos: frontmatter (YAML), TOML e caminhos
+# =============================================================================
+# aceita BOM, CRLF (arquivos do Windows) e espaços depois do --- de fechamento
+FRONT_RE = re.compile(r"^﻿?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)(.*)$", re.S)
+PLAIN_SCALAR = re.compile(r"^(true|false|yes|no|on|off|null|~|-?\d+(\.\d+)?)$", re.I)
+QUOTED_KEYS = ("name", "description", "argument-hint")
 
 
-def parse_front(text):
+def parse_front(text: str) -> tuple[dict, str]:
+    """(frontmatter, corpo). Sem frontmatter: ({}, texto). YAML inválido: ValueError."""
     m = FRONT_RE.match(text)
     if not m:
         return {}, text
     try:
-        meta = yaml.safe_load(m.group(1)) or {}
-    except Exception as e:
-        raise ValueError(f"frontmatter YAML inválido: {e}")
+        meta = yaml.safe_load(m.group(1).replace("\r\n", "\n")) or {}
+    except yaml.YAMLError as e:
+        raise ValueError(f"frontmatter YAML inválido: {e}") from None
     if not isinstance(meta, dict):
         raise ValueError("frontmatter YAML inválido: não é um mapa chave: valor")
     return meta, m.group(2)
 
 
-def dump_front(meta, body):
-    """Frontmatter no padrão: name/description (e argument-hint) sempre entre aspas duplas."""
-    lines = []
-    for k in ("name", "description", "argument-hint"):
-        if meta.get(k) is not None:
-            lines.append(f"{k}: {json.dumps(str(meta[k]), ensure_ascii=False)}")
-    rest = {k: v for k, v in meta.items() if k not in ("name", "description", "argument-hint")}
+def dump_front(meta: dict, body: str) -> str:
+    """Frontmatter no padrão: name/description/argument-hint sempre entre aspas duplas, o resto em YAML."""
+    lines = [f"{k}: {json.dumps(str(meta[k]), ensure_ascii=False)}" for k in QUOTED_KEYS if meta.get(k) is not None]
+    rest = {k: v for k, v in meta.items() if k not in QUOTED_KEYS}
     if rest:
         lines.append(yaml.safe_dump(rest, allow_unicode=True, sort_keys=False, width=10000).rstrip())
-    return "---\n" + "\n".join(lines) + "\n---\n" + ("\n" if not body.startswith("\n") else "") + body.lstrip("\n").rstrip() + "\n"
+    return "---\n" + "\n".join(lines) + "\n---\n\n" + body.strip("\n").rstrip() + "\n"
 
 
-# caminhos de script que apontam pra skill dentro de uma ferramenta -> ~/.ia/skills/
-_HOME_RE = "|".join(re.escape(h) for h in ("~", "$HOME", "${HOME}", str(HOME)))
-TOOL_IDS = ("claude", "codex", "copilot", "kiro", "gemini")
-TOOL_SKILL_RE = re.compile(rf"({_HOME_RE})/\.(?:claude|codex|copilot|kiro|gemini)/skills/(?!synced/)(?=[A-Za-z0-9_-]+/)")
-
-
-def fix_paths(text):
-    try:  # dentro da home: mantém o estilo (~/..., $HOME/...)
-        rel = (IA / "skills").relative_to(HOME)
-        return TOOL_SKILL_RE.sub(lambda m: f"{m.group(1)}/{rel}/", text)
-    except ValueError:
-        return TOOL_SKILL_RE.sub(str(IA / "skills") + "/", text)
-
-
-def fix_skill_front(text, folder):
-    """Conserta o frontmatter da skill. Devolve (texto_novo, avisos)."""
-    notes = []
+def fix_skill_front(text: str, folder: str) -> tuple[str, list[str]]:
+    """Deixa o frontmatter de uma skill no padrão. Devolve (texto_novo, avisos).
+    Se já estiver no padrão, devolve o texto intacto (preserva comentários e formatação)."""
+    notes: list[str] = []
+    text = text.removeprefix("﻿")
     m = FRONT_RE.match(text)
-    raw, body = (m.group(1), m.group(2)) if m else ("", text)
+    raw, body = (m.group(1).replace("\r\n", "\n"), m.group(2)) if m else ("", text)
     try:
         meta = yaml.safe_load(raw) or {}
         if not isinstance(meta, dict):
             raise ValueError
         quoted = all(re.search(rf'^{k}:\s*"', raw, re.M) for k in ("description", "argument-hint")
                      if re.search(rf"^{k}:\s*\S", raw, re.M))
-        if m and quoted and meta.get("name") == folder and meta.get("description"):
-            return text, []  # já está no padrão: não reescreve (mantém comentários/formatação)
-    except Exception:
-        # YAML inválido quase sempre é valor com ": " sem aspas: põe aspas linha a linha
+        if m and "\r\n" not in text and quoted and meta.get("name") == folder and meta.get("description"):
+            return text, []
+    except (yaml.YAMLError, ValueError):
+        # YAML inválido quase sempre é valor com ": " sem aspas: põe aspas linha a linha,
+        # sem transformar booleanos/números em texto
         out = []
         for line in raw.split("\n"):
             mm = re.match(r"^([A-Za-z0-9_-]+):[ \t]+(.+?)\s*$", line)
-            if mm and mm.group(2)[0] not in "\"'|>[{&*!":
+            if mm and mm.group(2)[0] not in "\"'|>[{&*!" and not PLAIN_SCALAR.match(mm.group(2)):
                 line = f"{mm.group(1)}: {json.dumps(mm.group(2), ensure_ascii=False)}"
             out.append(line)
         try:
             meta = yaml.safe_load("\n".join(out)) or {}
             if not isinstance(meta, dict):
                 raise ValueError
-        except Exception:
+        except (yaml.YAMLError, ValueError):
             return text, ["frontmatter YAML inválido e não consegui consertar sozinho; corrija à mão"]
-    if meta.get("name") != folder:
-        meta["name"] = folder
+    meta["name"] = folder
     if not meta.get("description"):
-        first = next((l.strip(" #*_>-") for l in body.splitlines() if l.strip() and not l.lstrip().startswith(("#", "```"))), "")
+        first = next((ln.strip(" #*_>-") for ln in body.splitlines()
+                      if ln.strip() and not ln.lstrip().startswith(("#", "```"))), "")
         meta["description"] = first[:250] or folder
         notes.append("não tinha 'description'; gerei uma a partir do texto, revise")
     meta = {"name": meta.pop("name"), "description": meta.pop("description"), **meta}
-    return dump_front(meta, body), notes
+    return dump_front(meta, body.replace("\r\n", "\n")), notes
 
 
-def load_secrets():
-    env = {}
-    if SECRETS.exists():
-        for line in SECRETS.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                v = v.strip()
-                if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
-                    v = v[1:-1]
-                env[k.strip()] = v
+def toml_key(k: str) -> str:
+    return k if re.fullmatch(r"[A-Za-z0-9_-]+", k) else json.dumps(k, ensure_ascii=False)
+
+
+def toml_val(v) -> str:
+    """Valor Python -> TOML (strings JSON são strings básicas TOML válidas). None é omitido."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_val(x) for x in v if x is not None) + "]"
+    if isinstance(v, dict):
+        return "{ " + ", ".join(f"{toml_key(k)} = {toml_val(x)}" for k, x in v.items() if x is not None) + " }"
+    return json.dumps(str(v), ensure_ascii=False)
+
+
+def toml_str(s: str) -> str:
+    """Texto longo: string literal multilinha (legível); se não couber, string básica escapada."""
+    lit = "'''\n" + s + "\n'''"  # a quebra logo depois de ''' o TOML ignora; a do fim fica no valor (inofensivo)
+    if "'''" not in s:
+        with contextlib.suppress(tomllib.TOMLDecodeError):
+            if tomllib.loads(f"x = {lit}")["x"] == s + "\n":
+                return lit
+    return json.dumps(s, ensure_ascii=False)
+
+
+# ~/.claude/skills/<x>/..., $HOME/.codex/skills/<x>/... etc. -> <pasta>/skills/<x>/...
+_HOME_ALT = "|".join(re.escape(h) for h in ("~", "$HOME", "${HOME}", str(HOME)))
+TOOL_SKILL_RE = re.compile(rf"({_HOME_ALT})/\.(?:{'|'.join(TOOL_IDS)})/skills/(?!synced/)(?=[A-Za-z0-9_-]+/)")
+
+
+def fix_paths(text: str) -> str:
+    try:  # dentro da home: mantém o estilo do texto (~/..., $HOME/...)
+        rel = (IA / "skills").relative_to(HOME)
+        return TOOL_SKILL_RE.sub(lambda m: f"{m.group(1)}/{rel}/", text)
+    except ValueError:
+        return TOOL_SKILL_RE.sub(str(IA / "skills") + "/", text)
+
+
+# =============================================================================
+# Segredos (secrets.env)
+# =============================================================================
+def load_secrets() -> dict[str, str]:
+    """Lê NOME="valor" (aspas duplas = string JSON, simples = literal, sem aspas = como está)."""
+    env: dict[str, str] = {}
+    for line in (read_text(SECRETS) or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = (s.strip() for s in line.removeprefix("export ").split("=", 1))
+        if len(v) >= 2 and v[0] == v[-1] == '"':
+            try:
+                v = json.loads(v)
+            except ValueError:
+                v = v[1:-1]
+        elif len(v) >= 2 and v[0] == v[-1] == "'":
+            v = v[1:-1]
+        env[k] = v
     return env
 
 
-def add_secret(name, value, secrets):
+def add_secret(name: str, value: str, secrets: dict[str, str]) -> str:
+    """Guarda um segredo no secrets.env (0600 desde a criação). Devolve o nome usado: se o nome já
+    existe com outro valor, usa NOME_2, NOME_3... (nunca sobrescreve outro segredo)."""
+    base, n = name, 2
+    while name in secrets and secrets[name] != value:
+        name, n = f"{base}_{n}", n + 1
+    if secrets.get(name) == value:
+        return name
     secrets[name] = value
-    if DRY:
-        return
-    lines = SECRETS.read_text().splitlines() if SECRETS.exists() else ["# segredos usados em mcp/servers.json como ${NOME}. NÃO versionar."]
-    lines = [l for l in lines if not l.startswith(name + "=")]
-    lines.append(f"{name}={json.dumps(value)}")
-    SECRETS.write_text("\n".join(lines) + "\n")
-    SECRETS.chmod(0o600)
+    lines = (read_text(SECRETS) or "# segredos usados em mcp/servers.json como ${NOME}. NÃO versionar.\n").splitlines()
+    lines = [ln for ln in lines if not ln.startswith(name + "=")] + [f"{name}={json.dumps(value)}"]
+    write_file(SECRETS, "\n".join(lines) + "\n", 0o600)
+    return name
 
 
-def expand(obj, secrets):
+def expand(obj, secrets: dict[str, str]):
+    """Troca ${VAR} pelo valor (secrets.env, depois variáveis de ambiente) em toda a estrutura."""
     if isinstance(obj, str):
         def rep(m):
             k = m.group(1)
@@ -338,7 +579,7 @@ def expand(obj, secrets):
                 return os.environ[k]
             warn(f"variável ${{{k}}} não definida em secrets.env")
             return m.group(0)
-        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", rep, obj)
+        return VAR_RE.sub(rep, obj)
     if isinstance(obj, list):
         return [expand(v, secrets) for v in obj]
     if isinstance(obj, dict):
@@ -346,70 +587,76 @@ def expand(obj, secrets):
     return obj
 
 
-# ---------------------------------------------------------------- importação
-def adopt_entry(src, dest, label):
-    """Move src para dest no ~/.ia. Se já existir igual, descarta; se diferente, vai pra _conflicts."""
-    src, dest = Path(src), Path(dest)
+# =============================================================================
+# Importação: traz pro ~/.ia o que estiver solto nas ferramentas
+# =============================================================================
+def adopt_entry(src: Path, dest: Path, label: str) -> None:
+    """Move src pra dest no ~/.ia. Já existe igual: a duplicata vai pro backup. Diferente: vai pra _conflicts."""
+    if src.is_symlink():  # link (ex.: dentro de hooks/): não segue, decide pelo destino do link
+        if dest.exists() and os.path.realpath(src) == os.path.realpath(dest):
+            info(f"{show(src)} já aponta pra {show(dest)}; removendo link")
+            if not DRY:
+                src.unlink()
+        elif dest.exists() or dest.is_symlink():
+            warn(f"{show(src)} diverge de {show(dest)}; movido para {show(conflict(src, label))} (mescle à mão e apague)")
+        else:
+            info(f"importado {show(src)} -> {show(dest)}")
+            if not DRY:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dest))
+        return
     if not dest.exists():
-        info(f"importado {src} -> {dest}")
+        info(f"importado {show(src)} -> {show(dest)}")
         if not DRY:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dest))
     elif same(src, dest) or same_normalized(src, dest):
-        info(f"{src} já existe igual em {dest}; removendo duplicata")
-        if not DRY:
-            shutil.rmtree(src) if src.is_dir() else src.unlink()
+        info(f"{show(src)} já existe igual em {show(dest)}")
+        backup(src, f"duplicates/{rel_home(src)}")
     else:
-        c = IA / "_conflicts" / label / f"{src.name}-{TS}"
-        warn(f"{src} diverge de {dest}; movido para {c} (mescle à mão e apague)")
-        if not DRY:
-            c.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(c))
+        warn(f"{show(src)} diverge de {show(dest)}; movido para {show(conflict(src, label))} (mescle à mão e apague)")
 
 
-def import_skills(t):
-    d = t["skills"]
-    if not d or not d.is_dir() or d.is_symlink():
+def import_skills(t: Tool) -> None:
+    if not t.skills or not t.skills.is_dir() or not managed_dir(t.skills, "skills"):
         return
-    for e in sorted(d.iterdir()):
+    for e in ls(t.skills):
         if e.name in IGNORED_SKILL_DIRS or e.name.startswith(".") or e.is_symlink() or not e.is_dir():
             continue
-        if not (e / "SKILL.md").exists():
-            continue
-        adopt_entry(e, IA / "skills" / e.name, f"skills/{t['id']}")
+        if (e / "SKILL.md").exists():
+            adopt_entry(e, IA / "skills" / e.name, f"skills/{t.id}")
 
 
-def import_agents(t):
-    d = t.get("agents")
-    if not d or not d.is_dir() or d.is_symlink():
+def import_agents(t: Tool, state: dict) -> None:
+    d = t.agents
+    if not d or not d.is_dir() or not managed_dir(d, "agentes"):
         return
-    state = load_state()
-    fmt = t["agents_fmt"]
-    prompt_files = kiro_prompt_files(d) if fmt == "kiro" else set()
-    for e in sorted(d.iterdir()):
-        if e.is_symlink() or str(e) in state["generated"] or not e.is_file() or e in prompt_files:
+    prompt_files = {p for p in (kiro_prompt_file(f) for f in d.glob("*.json")) if p} if t.agents_fmt == "kiro" else set()
+    for e in ls(d):
+        if e.is_symlink() or str(e) in state["generated"] or not e.is_file() or e.resolve() in prompt_files:
             continue
-        if fmt == "claude" and e.suffix == ".md":
-            adopt_entry(e, IA / "agents" / e.name, f"agents/{t['id']}")
+        if t.agents_fmt == "claude":
+            if e.suffix == ".md":
+                adopt_entry(e, IA / "agents" / e.name, f"agents/{t.id}")
             continue
         try:
-            conv = agent_from_tool(fmt, e)
-        except Exception as ex:
-            warn(f"não consegui converter o agente {e}: {ex}")
+            conv = agent_from_tool(t, e)
+        except (ValueError, OSError, tomllib.TOMLDecodeError) as ex:
+            warn(f"não consegui converter o agente {show(e)}: {ex}")
             continue
-        if conv:
-            stem, text = conv
-            pf = kiro_prompt_file(e) if e.suffix == ".json" else None
-            adopt_converted(e, IA / "agents" / f"{stem}.md", text, f"agents/{t['id']}")
-            if pf:  # o prompt já foi copiado pra dentro do agente
-                if pf.parent == d.resolve() and pf.exists():
-                    backup(pf, f"imported/{rel_home(pf)}")
+        if not conv:
+            continue
+        stem, text, used_prompt = conv
+        adopt_converted(e, IA / "agents" / f"{stem}.md", text, t.id)
+        if used_prompt and used_prompt.exists() and used_prompt.parent == d.resolve():
+            backup(used_prompt, f"imported/{rel_home(used_prompt)}")  # o texto já foi pra dentro do agente
 
 
-def kiro_prompt_file(f):
+def kiro_prompt_file(f: Path) -> Path | None:
+    """Arquivo apontado por "prompt": "file://..." num agente .json do Kiro (resolvido), se houver."""
     try:
-        pr = str(json.loads(f.read_text()).get("prompt") or "") if f.exists() else ""
-    except Exception:
+        pr = str(json.loads(f.read_text()).get("prompt") or "")
+    except (OSError, ValueError, AttributeError):
         return None
     if not pr.startswith("file://"):
         return None
@@ -417,20 +664,14 @@ def kiro_prompt_file(f):
     return (pf if pf.is_absolute() else f.parent / pf).resolve()
 
 
-def kiro_prompt_files(d):
-    return {p for p in (kiro_prompt_file(f) for f in d.glob("*.json")) if p}
-
-
-AGENT_CORE = ("name", "description")
-
-
-def agent_from_tool(fmt, f):
-    """Converte agente no formato da ferramenta pro canônico (.md do Claude).
-    Campos que só aquela ferramenta entende ficam guardados em `<ferramenta>:` no frontmatter
-    e voltam quando o arquivo dela é gerado de novo."""
+def agent_from_tool(t: Tool, f: Path) -> tuple[str, str, Path | None] | None:
+    """Converte um agente do formato da ferramenta pro canônico (.md do Claude).
+    Campos que só aquela ferramenta entende ficam em `<ferramenta>:` no frontmatter e voltam
+    quando o arquivo dela é gerado de novo. Devolve (nome, texto, arquivo de prompt usado)."""
+    fmt, used = t.agents_fmt, None
     if fmt == "copilot" and f.name.endswith(".agent.md"):
         meta, body = parse_front(f.read_text())
-        stem = f.name[: -len(".agent.md")]
+        stem = f.name.removesuffix(".agent.md")
     elif fmt == "codex" and f.suffix == ".toml":
         meta = tomllib.loads(f.read_text())
         body = str(meta.pop("developer_instructions", ""))
@@ -440,22 +681,30 @@ def agent_from_tool(fmt, f):
         stem = f.stem
     elif fmt == "kiro" and f.suffix == ".json":
         meta = json.loads(f.read_text())
+        if not isinstance(meta, dict):
+            raise ValueError("não é um objeto JSON")
         body = str(meta.pop("prompt", "") or "")
         if body.startswith("file://"):
-            pf = Path(os.path.expanduser(body[7:]))
-            pf = pf if pf.is_absolute() else f.parent / pf
-            body = pf.read_text() if pf.is_file() else body
+            pf = kiro_prompt_file(f)
+            # Segurança: só copia pra dentro do agente arquivos de texto da própria pasta do Kiro.
+            # Um file:// pra fora dela (ex.: ~/.ssh/...) é mantido como referência, nunca copiado.
+            if pf and pf.is_file() and pf.is_relative_to(t.home.resolve()) and pf.stat().st_size <= MAX_TEXT \
+                    and (txt := read_text(pf)) is not None:
+                body, used = txt, pf
+            else:
+                warn(f"agente {show(f)}: prompt {body} fica como referência (fora da pasta do Kiro ou ilegível)")
         stem = f.stem
     else:
         return None
     canon = {"name": meta.get("name") or stem, "description": meta.get("description") or ""}
-    extra = {k: v for k, v in meta.items() if k not in AGENT_CORE}
+    extra = {k: v for k, v in meta.items() if k not in ("name", "description")}
     if extra:
         canon[fmt] = extra
-    return stem, dump_front(canon, fix_paths(body.strip()))
+    return stem, dump_front(canon, fix_paths(body.strip())), used
 
 
-def adopt_converted(src, dest, text, label):
+def adopt_converted(src: Path, dest: Path, text: str, tid: str) -> None:
+    """Como adopt_entry, mas pra um agente já convertido (o original vai pro backup)."""
     if dest.exists():
         try:
             dm, db = parse_front(dest.read_text())
@@ -463,325 +712,360 @@ def adopt_converted(src, dest, text, label):
         except ValueError:
             dm = None
         if dm is not None and db.strip() == nb.strip() and str(dm.get("description", "")) == str(nm.get("description", "")):
-            tool = label.split("/")[-1]
-            if nm.get(tool) and dm.get(tool) != nm.get(tool):  # guarda os campos extras dessa ferramenta
-                dm[tool] = nm[tool]
-                if not DRY:
-                    dest.write_text(dump_front(dm, db))
-            info(f"{src} já existe em {dest}; removendo duplicata")
-            backup(src, f"imported/{rel_home(src)}")
-            return
-        c = IA / "_conflicts" / label / f"{dest.name}-{TS}"
-        warn(f"{src} diverge de {dest}; versão convertida em {c} (mescle à mão e apague)")
-        if not DRY:
-            c.parent.mkdir(parents=True, exist_ok=True)
-            c.write_text(text)
-        backup(src, f"imported/{rel_home(src)}")
-        return
-    info(f"importado {src} -> {dest} (convertido)")
-    if not DRY:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text)
+            if nm.get(tid) and dm.get(tid) != nm.get(tid):  # guarda os campos extras dessa ferramenta
+                dm[tid] = nm[tid]
+                write_file(dest, dump_front(dm, db))
+            info(f"{show(src)} já existe em {show(dest)}")
+        else:
+            c = conflict(dest, f"agents/{tid}", text)
+            warn(f"{show(src)} diverge de {show(dest)}; versão convertida em {show(c)} (mescle à mão e apague)")
+    else:
+        info(f"importado {show(src)} -> {show(dest)} (convertido)")
+        write_file(dest, text)
     backup(src, f"imported/{rel_home(src)}")
 
 
-def import_instructions(t):
-    f = t.get("instructions")
+def append_instructions(src: Path, body: str) -> None:
+    """Anexa um texto de instruções no AGENTS.md (se ainda não estiver lá)."""
+    body = body.strip()
+    cur = read_text(AGENTS_MD) or ""
+    if body and body not in cur:
+        info(f"instruções de {show(src)} anexadas em {show(AGENTS_MD)}")
+        write_file(AGENTS_MD, cur.rstrip() + f"\n\n<!-- importado de {show(src)} em {TS} -->\n{body}\n")
+
+
+def import_instructions(t: Tool) -> None:
+    f = t.instructions
     if not f or f.is_symlink() or not f.exists():
         return
-    body = f.read_text().strip()
-    cur = AGENTS_MD.read_text() if AGENTS_MD.exists() else ""
-    if body and body not in cur:
-        info(f"instruções de {f} anexadas em {AGENTS_MD}")
-        if not DRY:
-            AGENTS_MD.write_text(cur.rstrip() + f"\n\n<!-- importado de {f} em {TS} -->\n{body}\n")
-    backup(f, f"instructions/{t['id']}/{f.name}")
+    body = read_text(f)
+    if body is None:
+        warn(f"{show(f)} não é texto UTF-8; deixei como está")
+        return
+    append_instructions(f, body)
+    backup(f, f"instructions/{t.id}/{f.name}")
 
 
-def import_steering(t):
+def import_steering(t: Tool) -> None:
     """Steering global do Kiro. Os que valem sempre (sem frontmatter ou inclusion: always) são instrução
     global -> entram no AGENTS.md (todas as IAs). Os condicionais (fileMatch/manual/auto) só o Kiro
-    entende -> vão pra ~/.ia/settings/kiro/steering e cada um vira link."""
-    d = t.get("steering")
-    if not d or not d.is_dir():
+    entende -> vão pra settings/kiro/steering e cada um vira link."""
+    d = t.steering
+    if not d or not d.is_dir() or d.is_symlink():
         return
-    keep = IA / "settings" / "kiro" / "steering"
     for f in sorted(d.glob("*.md")):
-        if f.is_symlink() or f == t.get("instructions"):
+        if f.is_symlink() or f == t.instructions:
+            continue
+        text = read_text(f)
+        if text is None:
             continue
         try:
-            meta, body = parse_front(f.read_text())
+            meta, body = parse_front(text)
         except ValueError:
-            meta, body = {"inclusion": "?"}, f.read_text()
+            meta, body = {"inclusion": "?"}, text
         if str(meta.get("inclusion", "always")) == "always":
-            cur = AGENTS_MD.read_text() if AGENTS_MD.exists() else ""
-            if body.strip() and body.strip() not in cur:
-                info(f"steering {f} (sempre ativo) anexado em {AGENTS_MD}")
-                if not DRY:
-                    AGENTS_MD.write_text(cur.rstrip() + f"\n\n<!-- importado de {f} em {TS} -->\n{body.strip()}\n")
+            append_instructions(f, body)
             backup(f, f"instructions/kiro/steering/{f.name}")
         else:
-            adopt_entry(f, keep / f.name, "settings/kiro/steering")
+            adopt_entry(f, IA / "settings" / "kiro" / "steering" / f.name, "settings/kiro/steering")
 
 
-def sync_steering(t):
-    d, keep = t.get("steering"), IA / "settings" / "kiro" / "steering"
-    if not d or not keep.is_dir():
-        return
-    want = {f.name for f in keep.glob("*.md")}
-    for n in sorted(want):
-        symlink(keep / n, d / n)
-    for e in d.iterdir() if d.is_dir() else []:
-        if e.name not in want and e != t.get("instructions") and points_into_ia(e) and str(Path(os.readlink(e))).startswith(str(keep)):
-            info(f"removido link órfão {e}")
-            if not DRY:
-                e.unlink()
-
-
-def import_settings(t):
-    for rel, target in t["settings"]:
+def import_settings(t: Tool) -> None:
+    for rel, target in t.settings:
         canon = IA / rel
         if target.is_symlink() or not target.exists():
             continue
-        if target.is_dir():  # pasta (hooks, workflows, powers...): junta item a item
+        if target.is_dir():  # pasta (hooks, workflows, powers): junta item a item
             if not canon.exists():
-                info(f"config {target} -> {canon}")
+                info(f"config {show(target)} -> {show(canon)}")
                 if not DRY:
                     canon.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(target), str(canon))
                 continue
-            for e in sorted(target.iterdir()):
-                adopt_entry(e, canon / e.name, f"settings/{rel}")
+            for e in ls(target):
+                adopt_entry(e, canon / e.name, rel)
             if not DRY and not any(target.iterdir()):
                 target.rmdir()
             continue
-        # arquivo real no lugar do link: ou é a 1ª vez, ou a ferramenta recriou o arquivo (escrita atômica).
-        # Em ambos os casos a versão da ferramenta é a mais recente.
+        # arquivo real no lugar do link: ou é a 1ª vez, ou a ferramenta recriou o arquivo (escrita atômica
+        # quebra o link). Nos dois casos a versão da ferramenta é a mais recente; a anterior vai pro backup.
         if canon.exists() and not same(canon, target):
             backup(canon, f"settings/{rel}")
-        info(f"config {target} -> {canon}")
+        info(f"config {show(target)} -> {show(canon)}")
         if not DRY:
             canon.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(target), str(canon))
 
 
-def to_canon_server(name, srv, secrets, src=""):
-    """Normaliza p/ formato Claude e tira segredos literais para secrets.env."""
-    out = {}
+MCP_KNOWN = {"type", "url", "httpUrl", "headers", "http_headers", "bearer_token_env_var", "command", "args", "env"}
+
+
+def to_canon_server(name: str, srv: dict, secrets: dict, src: str) -> dict | None:
+    """Normaliza um MCP de qualquer ferramenta pro formato canônico (o do Claude), tira segredos literais
+    pro secrets.env e guarda em `<ferramenta>: {...}` os campos que só a ferramenta de origem entende."""
     url = srv.get("url") or srv.get("httpUrl")
     if url:
         sse = srv.get("type") == "sse" or (src == "gemini" and not srv.get("httpUrl"))  # no Gemini, "url" = SSE
-        out["type"] = "sse" if sse else "http"
-        out["url"] = url
+        out = {"type": "sse" if sse else "http", "url": url}
         headers = dict(srv.get("headers") or srv.get("http_headers") or {})
         if srv.get("bearer_token_env_var"):
             headers["Authorization"] = "Bearer ${" + srv["bearer_token_env_var"] + "}"
         if headers:
             out["headers"] = headers
-    else:
-        out["type"] = "stdio"
-        out["command"] = srv.get("command")
+    elif srv.get("command"):
+        out = {"type": "stdio", "command": srv["command"]}
         if srv.get("args"):
             out["args"] = list(srv["args"])
         if srv.get("env"):
             out["env"] = dict(srv["env"])
-    known = {"type", "url", "httpUrl", "headers", "http_headers", "bearer_token_env_var", "command", "args", "env"}
-    extra = {k: v for k, v in srv.items() if k not in known and not (src == "copilot" and k == "tools" and v == ["*"])}
+    else:
+        return None
+    extra = {k: v for k, v in srv.items() if k not in MCP_KNOWN and not (src == "copilot" and k == "tools" and v == ["*"])}
+    if src == "codex" and srv.get("bearer_token_env_var"):
+        extra["bearer_token_env_var"] = srv["bearer_token_env_var"]  # o Codex continua lendo o token do ambiente
     if extra and src in TOOL_IDS:
         out[src] = extra
-    for field in ("headers", "env"):
-        for k, v in list(out.get(field, {}).items()):
-            if isinstance(v, str) and v and "${" not in v:
+    for fld in ("headers", "env"):
+        for k, v in list(out.get(fld, {}).items()):
+            if isinstance(v, str) and v and not VAR_RE.search(v):
                 var = re.sub(r"[^A-Z0-9]+", "_", f"MCP_{name}_{k}".upper()).strip("_")
-                add_secret(var, v, secrets)
-                out[field][k] = "${" + var + "}"
+                out[fld][k] = "${" + add_secret(var, v, secrets) + "}"
     return out
 
 
-def import_mcp(tl):
-    canon = json.loads(MCP_FILE.read_text()) if MCP_FILE.exists() else {"mcpServers": {}}
-    servers = canon.setdefault("mcpServers", {})
+def read_json(p: Path, what: str) -> dict | None:
+    """JSON de uma ferramenta; None (com aviso) se inválido. Nunca recria/sobrescreve o arquivo."""
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text() or "{}")
+    except (OSError, ValueError) as e:
+        warn(f"{show(p)} inválido ({e}); {what} pulado (o arquivo não foi alterado)")
+        return None
+    if not isinstance(data, dict):
+        warn(f"{show(p)} não é um objeto JSON; {what} pulado")
+        return None
+    return data
+
+
+def servers_of(data: dict | None) -> dict:
+    ms = (data or {}).get("mcpServers")
+    return ms if isinstance(ms, dict) else {}
+
+
+def load_canon_mcp() -> dict:
+    """servers.json do usuário. Inválido = erro fatal (checado antes de qualquer mudança)."""
+    if not MCP_FILE.exists():
+        return {"mcpServers": {}}
+    try:
+        data = json.loads(MCP_FILE.read_text())
+    except (OSError, ValueError) as e:
+        raise Fatal(f"{show(MCP_FILE)} tem erro de JSON: {e}")
+    if not isinstance(data, dict) or not isinstance(data.setdefault("mcpServers", {}), dict):
+        raise Fatal(f"{show(MCP_FILE)} precisa ser {{\"mcpServers\": {{...}}}}")
+    return data
+
+
+def codex_config() -> Path:
+    cfg = IA / "settings" / "codex" / "config.toml"
+    return cfg if cfg.exists() else HOME / ".codex" / "config.toml"
+
+
+def import_mcp(tl: list[Tool], state: dict) -> None:
+    canon = load_canon_mcp()
+    servers = canon["mcpServers"]
     secrets = load_secrets()
-    found = {}
-    cj = HOME / ".claude.json"
-    if cj.exists() and any(t["id"] == "claude" for t in tl):
-        found.update({n: ("claude", s) for n, s in json.loads(cj.read_text()).get("mcpServers", {}).items()})
-    cfg = IA / "settings/codex/config.toml"
-    if not cfg.exists():
-        cfg = HOME / ".codex/config.toml"
-    if cfg.exists():
+    found: dict[str, tuple[str, dict]] = {}
+    if any(t.id == "claude" for t in tl):
+        found.update({n: ("claude", s) for n, s in servers_of(read_json(HOME / ".claude.json", "import de MCP")).items()})
+    cfg = codex_config()
+    if any(t.id == "codex" for t in tl) and cfg.exists():
         try:
-            for n, s in tomllib.loads(cfg.read_text()).get("mcp_servers", {}).items():
+            for n, s in (tomllib.loads(cfg.read_text()).get("mcp_servers") or {}).items():
                 found.setdefault(n, ("codex", s))
-        except Exception as e:
-            warn(f"não consegui ler {cfg}: {e}")
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            warn(f"não consegui ler {show(cfg)}: {e}")
     for t in tl:
-        mf = t.get("mcp_file") and real_path(t, t["mcp_file"])
-        if mf and mf.exists():
-            try:
-                for n, s in json.loads(mf.read_text()).get("mcpServers", {}).items():
-                    found.setdefault(n, (t["id"], s))
-            except Exception as e:
-                warn(f"não consegui ler {mf}: {e}")
-    managed = set(load_state().get("mcp", {}).get("managed", []))
+        if t.mcp == "json" and t.mcp_file:
+            for n, s in servers_of(read_json(real_path(t, t.mcp_file), "import de MCP")).items():
+                found.setdefault(n, (t.id, s))
+    managed = set(state["mcp"].get("managed", []))
     for n, (src, s) in found.items():
         if n in servers or n in managed:
             continue
-        info(f"MCP '{n}' importado de {src}")
-        servers[n] = to_canon_server(n, s, secrets, src)
-    if not DRY:
-        MCP_FILE.parent.mkdir(parents=True, exist_ok=True)
-        MCP_FILE.write_text(json.dumps(canon, indent=2, ensure_ascii=False) + "\n")
-
-
-# ---------------------------------------------------------------- sincronização
-def text_files(root):
-    for f in sorted(Path(root).rglob("*")):
-        if f.is_file() and not f.is_symlink() and f.stat().st_size < 1_000_000:
-            try:
-                yield f, f.read_text()
-            except (UnicodeDecodeError, OSError):
-                continue
-
-
-def normalize():
-    """Deixa skills e agentes no padrão: frontmatter válido e com aspas, name = pasta,
-    e scripts chamados por ~/.ia/skills/... em vez de ~/.claude/skills/... etc."""
-    for d in sorted((IA / "skills").iterdir()):
-        f = d / "SKILL.md"
-        if not d.is_dir() or not f.exists():
+        if not NAME_RE.match(n) or not isinstance(s, dict):
+            warn(f"MCP '{n}' de {src} ignorado: nome inválido (use letras, números, _ . - @)")
             continue
-        for g, text in text_files(d):
-            new = fix_paths(text)
-            notes = []
+        conv = to_canon_server(n, s, secrets, src)
+        if conv is None:
+            warn(f"MCP '{n}' de {src} ignorado: sem 'command' nem 'url'")
+            continue
+        info(f"MCP '{n}' importado de {src}")
+        servers[n] = conv
+    new = json.dumps(canon, indent=2, ensure_ascii=False) + "\n"
+    if read_text(MCP_FILE) != new:
+        write_file(MCP_FILE, new)
+
+
+# =============================================================================
+# Padronização (skills e agentes já no ~/.ia)
+# =============================================================================
+def normalize() -> None:
+    """Frontmatter válido e com aspas, name = pasta, e scripts chamados por <pasta>/skills/... em vez de
+    ~/.claude/skills/... etc. Skills que são link pra fora do ~/.ia (um repo seu) não são tocadas."""
+    for d in ls(IA / "skills"):
+        f = d / "SKILL.md"
+        if d.is_symlink() or not d.is_dir() or not f.exists():
+            continue
+        for g in walk_files(d):
+            if g.stat().st_size > MAX_TEXT or (text := read_text(g)) is None:
+                continue
+            new, notes = fix_paths(text), []
             if g == f:
                 new, notes = fix_skill_front(new, d.name)
             for n in notes:
-                warn(f"{f}: {n}")
+                warn(f"{show(f)}: {n}")
             if new != text:
-                info(f"padronizado {g}")
-                if not DRY:
-                    g.write_text(new)
+                info(f"padronizado {show(g)}")
+                write_file(g, new)
     for f in sorted((IA / "agents").glob("*.md")):
-        text = f.read_text()
-        new = fix_paths(text)
-        if new != text:
-            info(f"padronizado {f}")
-            if not DRY:
-                f.write_text(new)
+        if f.is_symlink() or (text := read_text(f)) is None:
+            continue
+        if (new := fix_paths(text)) != text:
+            info(f"padronizado {show(f)}")
+            write_file(f, new)
 
 
-def sync_skills(t):
-    d = t["skills"]
-    if not d:
+# =============================================================================
+# Sincronização: skills, agentes, instruções e configs
+# =============================================================================
+def sync_skills(t: Tool) -> None:
+    d = t.skills
+    if not d or not managed_dir(d, "skills"):
         return
-    if d.is_symlink():  # alguém ligou a pasta inteira; prefiro por skill
-        if not DRY:
-            d.unlink()
-    if not DRY:
-        d.mkdir(parents=True, exist_ok=True)
-    want = {s.name for s in (IA / "skills").iterdir() if (s / "SKILL.md").exists()}
+    want = {s.name for s in ls(IA / "skills") if (s / "SKILL.md").exists()}
     for name in sorted(want):
         symlink(IA / "skills" / name, d / name)
-    if d.is_dir():
-        for e in d.iterdir():
-            if points_into_ia(e) and e.name not in want:
-                info(f"removido link órfão {e}")
-                if not DRY:
-                    e.unlink()
+    for e in ls(d):
+        if points_into_ia(e) and e.name not in want:
+            info(f"removido link órfão {show(e)}")
+            if not DRY:
+                e.unlink()
 
 
-def load_agents():
+def load_agents() -> dict[str, tuple[Path, dict, str]]:
     out = {}
-    ad = IA / "agents"
-    for f in sorted(ad.glob("*.md")) if ad.is_dir() else []:
+    for f in sorted((IA / "agents").glob("*.md")):
+        text = read_text(f)
+        if text is None:
+            continue
         try:
-            meta, body = parse_front(f.read_text())
+            meta, body = parse_front(text)
         except ValueError as e:
-            warn(f"{f}: {e}")
+            warn(f"{show(f)}: {e}")
             continue
         meta.setdefault("name", f.stem)
         out[f.stem] = (f, meta, body.strip())
     return out
 
 
-def toml_str(s):
-    if "'''" not in s and not s.startswith("\n"):
-        return "'''\n" + s + "\n'''"
-    return json.dumps(s, ensure_ascii=False)
+def render_agent(fmt: str, f: Path, meta: dict, body: str) -> tuple[str, str] | None:
+    """(extensão, conteúdo) do agente no formato da ferramenta; None se não der pra gerar."""
+    name, desc = str(meta["name"]), str(meta.get("description", ""))
+    extra = meta.get(fmt) if isinstance(meta.get(fmt), dict) else {}
+    extra = {k: v for k, v in extra.items() if k not in ("name", "description", "prompt", "developer_instructions")}
+    note = f"gerado por ia-sync a partir de {show(f)} — edite lá"
+    if fmt == "codex":
+        c = (f"# {note}\nname = {toml_val(name)}\ndescription = {toml_val(desc)}\n"
+             + "".join(f"{toml_key(k)} = {toml_val(v)}\n" for k, v in extra.items() if v is not None)
+             + f"developer_instructions = {toml_str(body)}\n")
+        try:
+            tomllib.loads(c)
+        except tomllib.TOMLDecodeError as e:
+            warn(f"agente {f.stem}: toml do codex ficaria inválido ({e}); pulado")
+            return None
+        return ".toml", c
+    if fmt == "copilot":
+        return ".agent.md", dump_front({"name": name, "description": desc, **extra}, f"<!-- {note} -->\n{body}")
+    if fmt == "kiro":
+        return ".json", json.dumps({"name": name, "description": desc, **extra, "prompt": body},
+                                   indent=2, ensure_ascii=False) + "\n"
+    return None
 
 
-def sync_agents(t, agents, state):
-    fmt, d = t.get("agents_fmt"), t.get("agents")
-    if not fmt or not d:
+def sync_agents(t: Tool, agents: dict, state: dict) -> None:
+    d, fmt = t.agents, t.agents_fmt
+    if not fmt or not d or not managed_dir(d, "agentes"):
         return
-    if d.is_symlink() and not DRY:
-        d.unlink()
     want = set()
     for stem, (f, meta, body) in agents.items():
-        desc = str(meta.get("description", ""))
-        extra = meta.get(fmt) if isinstance(meta.get(fmt), dict) else {}
-        if fmt == "claude":
+        if fmt == "claude":  # o Claude lê o canônico direto
             symlink(f, d / f.name)
             want.add(str(d / f.name))
             continue
-        if fmt == "codex":
-            p = d / f"{stem}.toml"
-            c = (f"# gerado por ia-sync a partir de {f} — edite lá\nname = {json.dumps(meta['name'])}\n"
-                 f"description = {json.dumps(desc, ensure_ascii=False)}\n"
-                 + "".join(f"{json.dumps(k) if not re.fullmatch(r'[A-Za-z0-9_-]+', k) else k} = {toml_val(v)}\n" for k, v in extra.items())
-                 + f"developer_instructions = {toml_str(body)}\n")
-            try:
-                tomllib.loads(c)
-            except Exception as e:
-                warn(f"agente {stem}: toml do codex ficaria inválido ({e}); pulado")
-                continue
-        elif fmt == "copilot":
-            p = d / f"{stem}.agent.md"
-            c = dump_front({"name": meta["name"], "description": desc, **extra},
-                           f"<!-- gerado por ia-sync a partir de {f} — edite lá -->\n{body}")
-        elif fmt == "kiro":
-            p = d / f"{stem}.json"
-            c = json.dumps({"name": meta["name"], "description": desc, **extra, "prompt": body}, indent=2, ensure_ascii=False) + "\n"
-        else:
+        r = render_agent(fmt, f, meta, body)
+        if r:
+            p = d / f"{stem}{r[0]}"
+            write_generated(p, r[1], state)
+            want.add(str(p))
+    for e in ls(d):  # remove gerados/links de agentes que não existem mais
+        if str(e) in want:
             continue
-        write_generated(p, c, state)
-        want.add(str(p))
-    # limpa gerados/links que não existem mais
-    if d.is_dir():
-        for e in d.iterdir():
-            if str(e) in want:
-                continue
-            if points_into_ia(e) or (str(e) in state["generated"] and e.is_file()):
-                info(f"removido agente órfão {e}")
-                if not DRY:
-                    e.unlink()
-                state["generated"].pop(str(e), None)
+        if points_into_ia(e) or (str(e) in state["generated"] and e.is_file() and not e.is_symlink()):
+            info(f"removido agente órfão {show(e)}")
+            if not DRY:
+                e.unlink()
+            state["generated"].pop(str(e), None)
 
 
-def sync_instructions(t):
-    if t.get("instructions") and AGENTS_MD.exists():
-        symlink(AGENTS_MD, t["instructions"])
+def sync_instructions(t: Tool) -> None:
+    if t.instructions and AGENTS_MD.exists():
+        symlink(AGENTS_MD, t.instructions)
 
 
-def sync_settings(t):
-    for rel, target in t["settings"]:
-        canon = IA / rel
-        if canon.exists():
-            symlink(canon, target)
+def sync_settings(t: Tool) -> None:
+    for rel, target in t.settings:
+        if (IA / rel).exists():
+            symlink(IA / rel, target)
 
 
-def desired_mcp(secrets):
-    canon = json.loads(MCP_FILE.read_text()) if MCP_FILE.exists() else {"mcpServers": {}}
+def sync_steering(t: Tool) -> None:
+    d, keep = t.steering, IA / "settings" / "kiro" / "steering"
+    if not d or not keep.is_dir() or d.is_symlink():
+        return
+    want = {f.name for f in keep.glob("*.md")}
+    for n in sorted(want):
+        symlink(keep / n, d / n)
+    for e in ls(d):
+        if e.name not in want and e != t.instructions and e.is_symlink() and str(link_target(e)).startswith(str(keep) + os.sep):
+            info(f"removido link órfão {show(e)}")
+            if not DRY:
+                e.unlink()
+
+
+# =============================================================================
+# Sincronização: MCPs
+# =============================================================================
+MCP_CORE = {"type", "url", "headers", "command", "args", "env"}
+
+
+def desired_mcp(secrets: dict) -> dict[str, tuple[list | None, list, dict]]:
+    """MCPs do servers.json, com segredos expandidos: {nome: (only, skip, servidor)}."""
     out = {}
-    for n, s in canon.get("mcpServers", {}).items():
-        if s.get("disabled") is True:
+    for n, s in load_canon_mcp()["mcpServers"].items():
+        if not isinstance(s, dict) or s.get("disabled") is True:
+            continue
+        if not NAME_RE.match(n):
+            warn(f"MCP '{n}' ignorado: nome inválido (use letras, números, _ . - @)")
+            continue
+        if not (s.get("url") or s.get("command")):
+            warn(f"MCP '{n}' ignorado: precisa de 'command' ou 'url'")
             continue
         out[n] = (s.get("only"), s.get("skip") or [], expand({k: v for k, v in s.items() if k not in ("only", "skip", "disabled")}, secrets))
     return out
 
 
-def for_tool(desired, tid):
+def for_tool(desired: dict, tid: str) -> dict[str, dict]:
     """Servidores dessa ferramenta, já com os campos extras dela (chave com o nome da ferramenta)."""
     out = {}
     for n, (only, skip, s) in desired.items():
@@ -792,21 +1076,43 @@ def for_tool(desired, tid):
     return out
 
 
-MCP_CORE = {"type", "url", "headers", "command", "args", "env"}
+def mcp_entry(tid: str, s: dict) -> dict:
+    """Servidor canônico -> formato do JSON de cada ferramenta."""
+    extra = {k: v for k, v in s.items() if k not in MCP_CORE}
+    if tid == "copilot":
+        if s.get("url"):
+            e = {"type": "sse" if s.get("type") == "sse" else "http", "url": s["url"]}
+        else:
+            e = {"type": "local", "command": s["command"], "args": s.get("args", [])}
+        e.update({k: s[k] for k in ("headers", "env") if s.get(k)})
+        return {**e, "tools": ["*"], **extra}
+    if tid == "gemini":  # Gemini: "url" = SSE, "httpUrl" = HTTP
+        if s.get("url"):
+            e = {("url" if s.get("type") == "sse" else "httpUrl"): s["url"]}
+            if s.get("headers"):
+                e["headers"] = s["headers"]
+        else:
+            e = {"command": s["command"], "args": s.get("args", [])}
+            if s.get("env"):
+                e["env"] = s["env"]
+        return {**e, **extra}
+    return {k: v for k, v in s.items() if k != "type"}  # kiro: formato do Claude sem "type"
 
 
-def sync_mcp_claude(servers, prev):
-    cj = HOME / ".claude.json"
-    cur = json.loads(cj.read_text()).get("mcpServers", {}) if cj.exists() else {}
+def sync_mcp_claude(servers: dict, prev: set) -> None:
     claude = shutil.which("claude")
     if not claude:
         warn("CLI 'claude' não encontrado; MCPs do Claude não sincronizados")
         return
+    data = read_json(HOME / ".claude.json", "sync de MCP do Claude")
+    if data is None:
+        return
+    cur = servers_of(data)
     for n in sorted(prev - set(servers)):
         if n in cur:
             info(f"claude: removendo MCP '{n}'")
             if not DRY:
-                subprocess.run([claude, "mcp", "remove", "-s", "user", n], capture_output=True)
+                subprocess.run([claude, "mcp", "remove", "-s", "user", n], capture_output=True, check=False)
     for n, s in servers.items():
         if cur.get(n) == s:
             continue
@@ -814,230 +1120,249 @@ def sync_mcp_claude(servers, prev):
         if DRY:
             continue
         if n in cur:
-            subprocess.run([claude, "mcp", "remove", "-s", "user", n], capture_output=True)
-        r = subprocess.run([claude, "mcp", "add-json", "-s", "user", n, json.dumps(s)], capture_output=True, text=True)
+            subprocess.run([claude, "mcp", "remove", "-s", "user", n], capture_output=True, check=False)
+        # nome já validado por NAME_RE (não começa com "-", então não vira opção da CLI)
+        r = subprocess.run([claude, "mcp", "add-json", "-s", "user", n, json.dumps(s)],
+                           capture_output=True, text=True, check=False)
         if r.returncode:
-            warn(f"claude mcp add-json {n}: {r.stderr.strip() or r.stdout.strip()}")
+            warn(f"claude mcp add-json {n}: {(r.stderr or r.stdout).strip()}")
 
 
-def toml_val(v):
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, (int, float)):
-        return str(v)
-    if isinstance(v, list):
-        return "[" + ", ".join(toml_val(x) for x in v) + "]"
-    if isinstance(v, dict):
-        return "{ " + ", ".join(f"{json.dumps(k)} = {toml_val(x)}" for k, x in v.items()) + " }"
-    return json.dumps(str(v), ensure_ascii=False)
-
-
-def sync_mcp_codex(servers, prev):
-    cfg = IA / "settings/codex/config.toml"
-    if not cfg.exists():
-        cfg = HOME / ".codex/config.toml"
-    text = cfg.read_text() if cfg.exists() else ""
+def sync_mcp_codex(servers: dict, prev: set) -> None:
+    """Reescreve só o bloco gerado do config.toml (e tira tabelas de MCPs gerenciados soltas no arquivo).
+    Linhas do usuário colocadas DEPOIS do bloco são movidas pro topo (no TOML elas cairiam dentro da
+    última tabela de MCP), com aviso."""
+    cfg = codex_config()
+    text = read_text(cfg) or ""
     names = set(servers) | prev
-    out, skipping = [], False
+    out, moved = [], []
+    skipping = in_block = after_block = False
     for line in text.splitlines():
-        m = re.match(r"^\s*\[\s*mcp_servers\.(\"[^\"]+\"|[A-Za-z0-9_-]+)(\.|\s*\])", line)
-        if m:
-            skipping = m.group(1).strip('"') in names
-        elif re.match(r"^\s*\[", line):
-            skipping = False
-        if line.strip() in ("# >>> ia-sync mcp (gerado; edite ~/.ia/mcp/servers.json) >>>", "# <<< ia-sync mcp <<<"):
+        s = line.strip()
+        if s.startswith(BLOCK_BEGIN):
+            in_block = True
+            continue
+        if s.startswith(BLOCK_END):
+            in_block, after_block, skipping = False, True, False
+            continue
+        if in_block:
+            continue
+        if re.match(r"^\s*\[", line):
+            after_block = False
+            m = re.match(r"^\s*\[\s*mcp_servers\.(\"[^\"]+\"|[A-Za-z0-9_-]+)(\.|\s*\])", line)
+            if m:  # tabela de MCP: sai se for um dos gerenciados (o bloco novo traz de volta)
+                key = json.loads(m.group(1)) if m.group(1).startswith('"') else m.group(1)
+                skipping = key in names
+            else:
+                skipping = False
+        elif after_block and s and not s.startswith("#"):
+            moved.append(line)
             continue
         if not skipping:
             out.append(line)
+    if moved:
+        warn(f"{show(cfg)}: {len(moved)} linha(s) depois do bloco gerado foram movidas pro topo do arquivo")
+        first_table = next((i for i, ln in enumerate(out) if re.match(r"^\s*\[", ln)), len(out))
+        out[first_table:first_table] = moved + [""]
     while out and not out[-1].strip():
         out.pop()
-    block = ["", "# >>> ia-sync mcp (gerado; edite ~/.ia/mcp/servers.json) >>>"]
+    block = ["", f"{BLOCK_BEGIN} (gerado; edite {SHOW}/mcp/servers.json) >>>"]
     for n, s in sorted(servers.items()):
-        key = n if re.fullmatch(r"[A-Za-z0-9_-]+", n) else json.dumps(n)
-        block.append(f"[mcp_servers.{key}]")
+        block.append(f"[mcp_servers.{toml_key(n)}]")
         if s.get("url"):
             block.append(f"url = {toml_val(s['url'])}")
-            if s.get("headers"):
-                block.append(f"http_headers = {toml_val(s['headers'])}")
+            headers = dict(s.get("headers") or {})
+            if s.get("bearer_token_env_var"):  # o token vem do ambiente; não grava no arquivo
+                headers.pop("Authorization", None)
+            if headers:
+                block.append(f"http_headers = {toml_val(headers)}")
         else:
             block.append(f"command = {toml_val(s['command'])}")
             if s.get("args"):
                 block.append(f"args = {toml_val(s['args'])}")
             if s.get("env"):
                 block.append(f"env = {toml_val(s['env'])}")
-        for k, v in s.items():
-            if k not in MCP_CORE:
-                block.append(f"{k if re.fullmatch(r'[A-Za-z0-9_-]+', k) else json.dumps(k)} = {toml_val(v)}")
+        block += [f"{toml_key(k)} = {toml_val(v)}" for k, v in s.items() if k not in MCP_CORE and v is not None]
         block.append("")
-    block.append("# <<< ia-sync mcp <<<")
+    block.append(f"{BLOCK_END} <<<")
     new = "\n".join(out + block) + "\n"
     try:
         tomllib.loads(new)
-    except Exception as e:
-        warn(f"config.toml do codex ficaria inválido ({e}); não alterado")
+    except tomllib.TOMLDecodeError as e:
+        warn(f"{show(cfg)} ficaria inválido ({e}); não alterado")
         return
     if new != text:
-        info(f"codex: MCPs atualizados em {cfg}")
-        if not DRY:
-            cfg.write_text(new)
+        info(f"codex: MCPs atualizados em {show(cfg)}")
+        write_file(cfg, new, 0o600)  # contém segredos expandidos
 
 
-def sync_mcp_json(t, servers, prev, state):
-    f = real_path(t, t["mcp_file"])
-    data = {}
-    if f.exists():
-        try:
-            data = json.loads(f.read_text())
-        except Exception:
-            warn(f"{f} inválido; recriando")
+def sync_mcp_json(t: Tool, servers: dict, prev: set) -> None:
+    f = real_path(t, t.mcp_file)
+    data = read_json(f, f"sync de MCP do {t.id}")
+    if data is None:
+        return
+    ms = data.get("mcpServers")
+    if ms is not None and not isinstance(ms, dict):
+        warn(f"{show(f)}: 'mcpServers' não é um objeto; sync de MCP do {t.id} pulado")
+        return
     ms = data.setdefault("mcpServers", {})
     for n in prev - set(servers):
         ms.pop(n, None)
     for n, s in servers.items():
-        if t["id"] == "copilot":
-            e = {"type": "http", "url": s["url"]} if s.get("url") else {"type": "local", "command": s["command"], "args": s.get("args", [])}
-            if s.get("headers"):
-                e["headers"] = s["headers"]
-            if s.get("env"):
-                e["env"] = s["env"]
-            e["tools"] = ["*"]
-            e.update({k: v for k, v in s.items() if k not in MCP_CORE})
-        elif t["id"] == "gemini":
-            if s.get("url"):
-                e = {("url" if s.get("type") == "sse" else "httpUrl"): s["url"]}
-                if s.get("headers"):
-                    e["headers"] = s["headers"]
-            else:
-                e = {"command": s["command"], "args": s.get("args", [])}
-                if s.get("env"):
-                    e["env"] = s["env"]
-            e.update({k: v for k, v in s.items() if k not in MCP_CORE})
-        else:  # kiro
-            e = {k: v for k, v in s.items() if k != "type"}
-        ms[n] = e
+        ms[n] = mcp_entry(t.id, s)
     c = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    if not f.exists() or f.read_text() != c:
-        info(f"{t['id']}: MCPs atualizados em {f}")
-        if not DRY:
-            f.parent.mkdir(parents=True, exist_ok=True)
-            f.write_text(c)
-            f.chmod(0o600)
-    for rel, target in t["settings"]:  # config criado agora no ~/.ia: já liga
+    if read_text(f) != c:
+        info(f"{t.id}: MCPs atualizados em {show(f)}")
+        write_file(f, c, 0o600)  # contém segredos expandidos
+    for rel, target in t.settings:  # config criada agora no ~/.ia: já liga
         if f == IA / rel and (f.exists() or DRY):
             symlink(f, target)
 
 
-def sync_mcp(tl, state):
-    secrets = load_secrets()
-    desired = desired_mcp(secrets)
-    prev_all = state.setdefault("mcp", {})
+def sync_mcp(tl: list[Tool], state: dict) -> None:
+    desired = desired_mcp(load_secrets())
+    prev_all = state["mcp"]
     for t in tl:
-        kind = t.get("mcp")
-        if not kind:
+        if not t.mcp:
             continue
-        servers = for_tool(desired, t["id"])
-        prev = set(prev_all.get(t["id"], [])) - set(servers)
-        if kind == "claude-cli":
+        servers = for_tool(desired, t.id)
+        prev = set(prev_all.get(t.id, [])) - set(servers)  # gerenciados antes e que saíram
+        if t.mcp == "claude-cli":
             sync_mcp_claude(servers, prev)
-        elif kind == "codex-toml":
+        elif t.mcp == "codex-toml":
             sync_mcp_codex(servers, prev)
         else:
-            sync_mcp_json(t, servers, prev, state)
-        prev_all[t["id"]] = sorted(servers)
+            sync_mcp_json(t, servers, prev)
+        prev_all[t.id] = sorted(servers)
     prev_all["managed"] = sorted(desired)
 
 
-# ---------------------------------------------------------------- main
-def ensure_layout():
+# =============================================================================
+# Preparação, backup inicial e trava
+# =============================================================================
+def check_location() -> None:
+    """Recusa pastas perigosas pro ~/.ia (a home inteira, a raiz, ou dentro da pasta de uma IA)."""
+    bad = {Path("/"), HOME} | {HOME / f".{i}" for i in TOOL_IDS}
+    if IA in bad or any(IA.is_relative_to(HOME / f".{i}") for i in TOOL_IDS):
+        raise Fatal(f"{IA} não pode ser a pasta do ia-sync; use uma pasta só pra isso (ex.: ~/.ia)")
+
+
+def ensure_layout() -> None:
+    if DRY:
+        return
     for sub in ("skills", "agents", "mcp", "settings"):
         (IA / sub).mkdir(parents=True, exist_ok=True)
-    if not (IA / MARKER).exists() and not DRY:
-        (IA / MARKER).write_text("pasta de configs de IA do ia-sync (não apague)\n")
-    # fora do git: segredos, estado, backups e configs onde os MCPs são gravados já com os segredos expandidos
+    if not (IA / MARKER).exists():
+        write_file(IA / MARKER, "pasta de configs de IA do ia-sync (não apague)\n")
+    # fora do git: segredos, estado, backups e configs onde os MCPs ficam com o segredo já preenchido
     gi = IA / ".gitignore"
-    want = ["secrets.env", ".state.json", "_backup/", "_conflicts/",
+    want = ["secrets.env", ".state.json", ".lock", "_backup/", "_conflicts/",
             "settings/codex/config.toml", "settings/gemini/settings.json", "settings/copilot/config.json"]
-    cur = gi.read_text().splitlines() if gi.exists() else []
-    missing = [w for w in want if w not in cur]
-    if missing and not DRY:
-        gi.write_text("\n".join(cur + missing) + "\n")
-    # deixa o comando `ia-sync` no PATH
+    cur = (read_text(gi) or "").splitlines()
+    if missing := [w for w in want if w not in cur]:
+        write_file(gi, "\n".join(cur + missing) + "\n")
+    # instalações antigas: segredos e backups legíveis por outros usuários -> só o dono
+    fix = [(SECRETS, 0o600)] + [(IA / d, 0o700) for d in ("_backup", "_conflicts")]
+    fix += [(f, 0o600) for f in (IA / "_backup").glob("*.tgz")]
+    for p, mode in fix:
+        if p.exists() and not p.is_symlink() and p.stat().st_mode & 0o077:
+            os.chmod(p, mode)
+            info(f"permissão de {show(p)} corrigida pra {mode:o}")
+
+
+def ensure_command() -> None:
+    """Deixa o comando `ia-sync` no PATH (link em ~/.local/bin)."""
     me, link = IA / "bin" / "ia-sync", HOME / ".local" / "bin" / "ia-sync"
     if me.exists() and not link.exists() and not link.is_symlink():
-        info(f"instalado comando {link} -> {me}")
+        info(f"instalado comando {show(link)} -> {show(me)}")
         if not DRY:
             link.parent.mkdir(parents=True, exist_ok=True)
             link.symlink_to(me)
-    if str(link.parent) not in os.environ.get("PATH", "").split(":"):
-        warn(f"{link.parent} não está no PATH; adicione no ~/.bashrc: export PATH=\"$HOME/.local/bin:$PATH\"")
+    if str(link.parent) not in os.environ.get("PATH", "").split(os.pathsep):
+        warn(f"{show(link.parent)} não está no PATH; adicione no ~/.bashrc: export PATH=\"$HOME/.local/bin:$PATH\"")
 
 
-def first_run_backup(tl):
-    """Na 1ª execução guarda tudo que pode ser mexido, pra dar pra voltar atrás."""
+def first_run_backup(tl: list[Tool]) -> None:
+    """Na 1ª execução guarda tudo que pode ser mexido (0600: tem segredos), pra dar pra voltar atrás."""
     if STATE_FILE.exists() or DRY:
         return
     paths = {HOME / ".claude.json"}
     for t in tl:
-        paths |= {t.get(k) for k in ("skills", "agents", "instructions", "mcp_file", "steering")}
-        paths |= {target for _, target in t["settings"]}
+        paths |= {t.skills, t.agents, t.instructions, t.mcp_file, t.steering}
+        paths |= {target for _, target in t.settings}
     paths = sorted(p for p in paths if p and (p.exists() or p.is_symlink()))
     if not paths:
         return
-    dest = IA / "_backup" / f"pre-ia-sync-{TS}.tgz"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(dest, "w:gz") as tar:
-        for p in paths:
-            tar.add(p, arcname=rel_home(p))
-    info(f"backup do estado atual em {dest}")
+    dest = unique(private_dir(IA / "_backup") / f"pre-ia-sync-{TS}.tgz")
+    old = os.umask(0o077)
+    try:
+        with tarfile.open(dest, "w:gz") as tar:
+            for p in paths:
+                tar.add(p, arcname=rel_home(p))  # links entram como links (não segue)
+    finally:
+        os.umask(old)
+    info(f"backup do estado atual em {show(dest)}")
 
 
-def status(tl):
-    print(f"fonte: {IA}")
-    print(f"  skills: {', '.join(sorted(p.name for p in (IA/'skills').iterdir() if (p/'SKILL.md').exists()))}")
-    print(f"  agentes: {', '.join(sorted(load_agents())) or '-'}")
-    print(f"  MCPs: {', '.join(json.loads(MCP_FILE.read_text())['mcpServers']) if MCP_FILE.exists() else '-'}")
-    for t in tl:
-        print(f"[{t['id']}] {t['home']}")
-        for label, p in (("skills", t["skills"]), ("instruções", t.get("instructions"))):
-            if not p:
-                continue
-            if label == "skills":
-                n = sum(1 for e in p.iterdir() if points_into_ia(e)) if p.is_dir() else 0
-                loose = [e.name for e in p.iterdir() if p.is_dir() and e.is_dir() and not e.is_symlink() and e.name not in IGNORED_SKILL_DIRS and (e / "SKILL.md").exists()] if p.is_dir() else []
-                print(f"  skills: {n} ligadas" + (f", SOLTAS: {loose}" if loose else ""))
-            else:
-                print(f"  instruções: {'ok' if points_into_ia(p) else 'NÃO ligado'} ({p})")
-        for rel, target in t["settings"]:
-            print(f"  config: {'ok' if points_into_ia(target) else 'NÃO ligado'} ({target})")
-
-
-def main():
-    global DRY, QUIET
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", nargs="?", default="sync", choices=["sync", "status"])
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--quiet", action="store_true")
-    a = ap.parse_args()
-    DRY, QUIET = a.dry_run, a.quiet
-    tl = tools()
-    ensure_layout()
-    if a.cmd == "status":
-        status(tl)
+@contextlib.contextmanager
+def lock():
+    """Uma execução por vez (ex.: dois terminais, ou um hook rodando junto)."""
+    if DRY or not IA.exists():
+        yield
         return
+    with open(LOCK_FILE, "w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Fatal("outro ia-sync está rodando; espere ele terminar") from None
+        yield
+
+
+# =============================================================================
+# Comandos
+# =============================================================================
+def status(tl: list[Tool]) -> None:
+    print(f"ia-sync {VERSION} — fonte: {IA}")
+    print(f"  skills: {', '.join(p.name for p in ls(IA / 'skills') if (p / 'SKILL.md').exists()) or '-'}")
+    print(f"  agentes: {', '.join(load_agents()) or '-'}")
+    try:
+        print(f"  MCPs: {', '.join(load_canon_mcp()['mcpServers']) or '-'}")
+    except Fatal as e:
+        print(f"  MCPs: ⚠ {e}")
+    for t in tl:
+        print(f"[{t.id}] {show(t.home)}")
+        if t.skills:
+            linked = sum(1 for e in ls(t.skills) if points_into_ia(e))
+            loose = [e.name for e in ls(t.skills) if e.is_dir() and not e.is_symlink()
+                     and e.name not in IGNORED_SKILL_DIRS and (e / "SKILL.md").exists()]
+            print(f"  skills: {linked} ligadas" + (f", SOLTAS: {loose}" if loose else ""))
+        if t.instructions:
+            print(f"  instruções: {'ok' if points_into_ia(t.instructions) else 'NÃO ligado'} ({show(t.instructions)})")
+        for _, target in t.settings:
+            if target.exists() or target.is_symlink():
+                print(f"  config: {'ok' if points_into_ia(target) else 'NÃO ligado'} ({show(target)})")
+
+
+def sync(tl: list[Tool]) -> None:
+    # 1. checagem: o que é do usuário precisa estar válido antes de mexer em qualquer coisa
+    load_canon_mcp()
+    state = load_state()
     first_run_backup(tl)
+    # 2. importação
     if not QUIET:
         print(f"importando o que estiver fora do {SHOW}...")
     for t in tl:
         import_skills(t)
-        import_agents(t)
+        import_agents(t, state)
         import_instructions(t)
         import_settings(t)
         import_steering(t)
-    import_mcp(tl)
+    import_mcp(tl, state)
+    # 3. padronização
     if not QUIET:
-        print("sincronizando ferramentas: " + ", ".join(t["id"] for t in tl))
+        print("sincronizando ferramentas: " + (", ".join(t.id for t in tl) or "nenhuma encontrada"))
     normalize()
-    state = load_state()
+    # 4. sincronização
     agents = load_agents()
     for t in tl:
         sync_skills(t)
@@ -1047,9 +1372,43 @@ def main():
         sync_steering(t)
     sync_mcp(tl, state)
     save_state(state)
+
+
+def main() -> int:
+    global DRY, QUIET
+    ap = argparse.ArgumentParser(prog="ia-sync", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", nargs="?", default="sync", choices=["sync", "status"])
+    ap.add_argument("--dry-run", action="store_true", help="só mostra o que faria")
+    ap.add_argument("--quiet", action="store_true", help="só imprime avisos/erros")
+    ap.add_argument("--debug", action="store_true", help="mostra o traceback completo em caso de erro")
+    ap.add_argument("--version", action="version", version=f"ia-sync {VERSION}")
+    a = ap.parse_args()
+    DRY, QUIET = a.dry_run, a.quiet
+    try:
+        check_location()
+        tl = tools()
+        if a.cmd == "status":
+            status(tl)
+            return 0
+        ensure_layout()
+        with lock():
+            ensure_command()
+            sync(tl)
+    except Fatal as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n✗ interrompido; rode de novo pra terminar (o que já foi feito tem backup)", file=sys.stderr)
+        return 130
+    except Exception as e:  # noqa: BLE001 — última barreira: mensagem curta + como depurar
+        if a.debug:
+            traceback.print_exc()
+        print(f"✗ erro inesperado: {e.__class__.__name__}: {e}\n  rode com --debug pra ver detalhes", file=sys.stderr)
+        return 1
     if not QUIET:
         print(f"pronto: {len(changes)} mudança(s), {len(warnings)} aviso(s){' (dry-run)' if DRY else ''}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -196,6 +196,15 @@ Opções por MCP: `"only": ["claude"]`, `"skip": ["copilot"]`, `"disabled": true
   _conflicts/          o que você precisa juntar à mão
 ```
 
+**Segurança:**
+- os segredos ficam só no `secrets.env` (0600). Os arquivos que recebem o segredo já preenchido (configs de MCP do Codex, Copilot, Kiro e Gemini) também são gravados 0600;
+- `_backup/` e `_conflicts/` são 0700, e o backup `.tgz` da 1ª vez é 0600;
+- toda escrita é atômica, então uma queda no meio não corrompe config; nada é apagado sem backup, e arquivo inválido é pulado, nunca recriado;
+- `servers.json` com erro faz o sync parar **antes** de mexer em qualquer coisa;
+- agente do Kiro com `prompt: file://...` apontando pra fora da pasta do Kiro não tem o arquivo copiado (fica só a referência);
+- `bearer_token_env_var` do Codex é mantido: o token continua só na variável de ambiente;
+- limitação: o Claude Code só aceita MCP via `claude mcp add-json`, então o JSON com o segredo aparece por milissegundos na lista de processos (`ps`).
+
 **Versionar o seu `~/.ia`:** dá pra fazer `git init` nele. O `.gitignore` gerado já deixa de fora os segredos, os backups
 e as configs onde os MCPs ficam com o segredo preenchido.
 
