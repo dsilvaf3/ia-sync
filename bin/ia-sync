@@ -17,7 +17,21 @@ except ImportError:
     sys.exit("ia-sync precisa do PyYAML: sudo apt install python3-yaml  (ou pip install pyyaml)")
 
 HOME = Path.home()
-IA = Path(os.environ.get("IA_HOME", HOME / ".ia"))
+MARKER = ".ia-sync-home"  # marca a pasta escolhida na instalação
+
+
+def find_ia():
+    """Pasta das configs: $IA_HOME > pasta onde o script está instalado (<pasta>/bin/ia-sync) > ~/.ia."""
+    if os.environ.get("IA_HOME"):
+        return Path(os.environ["IA_HOME"]).expanduser().resolve()
+    here = Path(__file__).resolve().parent.parent
+    if (here / MARKER).exists():
+        return here
+    return HOME / ".ia"
+
+
+IA = find_ia()
+SHOW = f"~/{IA.relative_to(HOME)}" if IA.is_relative_to(HOME) else str(IA)  # pra mensagens
 TS = time.strftime("%Y%m%d-%H%M%S")
 STATE_FILE = IA / ".state.json"
 SECRETS = IA / "secrets.env"
@@ -201,7 +215,7 @@ def write_generated(path, content, state):
             state["generated"][key] = hashlib.sha256(content.encode()).hexdigest()
             return
         if state["generated"].get(key) != sha(path):
-            warn(f"{path} foi editado fora do ~/.ia; backup feito antes de sobrescrever")
+            warn(f"{path} foi editado fora do {SHOW}; backup feito antes de sobrescrever")
             backup(path, f"edited/{rel_home(path)}")
     info(f"gerado {path}")
     if not DRY:
@@ -245,9 +259,11 @@ TOOL_SKILL_RE = re.compile(rf"({_HOME_RE})/\.(?:claude|codex|copilot|kiro|gemini
 
 
 def fix_paths(text):
-    if IA == HOME / ".ia":
-        return TOOL_SKILL_RE.sub(lambda m: m.group(1) + "/.ia/skills/", text)
-    return TOOL_SKILL_RE.sub(str(IA / "skills") + "/", text)
+    try:  # dentro da home: mantém o estilo (~/..., $HOME/...)
+        rel = (IA / "skills").relative_to(HOME)
+        return TOOL_SKILL_RE.sub(lambda m: f"{m.group(1)}/{rel}/", text)
+    except ValueError:
+        return TOOL_SKILL_RE.sub(str(IA / "skills") + "/", text)
 
 
 def fix_skill_front(text, folder):
@@ -935,6 +951,8 @@ def sync_mcp(tl, state):
 def ensure_layout():
     for sub in ("skills", "agents", "mcp", "settings"):
         (IA / sub).mkdir(parents=True, exist_ok=True)
+    if not (IA / MARKER).exists() and not DRY:
+        (IA / MARKER).write_text("pasta de configs de IA do ia-sync (não apague)\n")
     # fora do git: segredos, estado, backups e configs onde os MCPs são gravados já com os segredos expandidos
     gi = IA / ".gitignore"
     want = ["secrets.env", ".state.json", "_backup/", "_conflicts/",
@@ -1008,7 +1026,7 @@ def main():
         return
     first_run_backup(tl)
     if not QUIET:
-        print("importando o que estiver fora do ~/.ia...")
+        print(f"importando o que estiver fora do {SHOW}...")
     for t in tl:
         import_skills(t)
         import_agents(t)

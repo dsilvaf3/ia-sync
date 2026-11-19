@@ -24,14 +24,30 @@ cd ia-sync && ./install.sh
 
 O instalador:
 1. confere o Python 3.11+ e instala o PyYAML se faltar;
-2. coloca o script em `~/.ia/bin/ia-sync` e o comando `ia-sync` em `~/.local/bin` (ajusta o PATH se precisar);
-3. instala a skill `/ia-sync`, que ensina as IAs a usar o padrão;
-4. adiciona no `~/.ia/AGENTS.md` a regra "tudo de IA fica em ~/.ia";
-5. mostra uma **simulação** do que vai acontecer. Nada é alterado até você rodar:
+2. **pergunta onde guardar suas configs** (padrão `~/.ia`, Enter aceita; veja abaixo);
+3. coloca o script em `<pasta>/bin/ia-sync` e o comando `ia-sync` em `~/.local/bin` (ajusta o PATH se precisar);
+4. instala a skill `/ia-sync`, que ensina as IAs a usar o padrão;
+5. adiciona no `AGENTS.md` da pasta a regra "tudo de IA fica aqui";
+6. mostra uma **simulação** do que vai acontecer. Nada é alterado até você rodar:
 
 ```bash
 ia-sync
 ```
+
+### Escolher a pasta
+
+O padrão é `~/.ia`, mas pode ser qualquer uma (ex.: `~/dotfiles/ia`, pra versionar junto com seus dotfiles):
+
+- **a pasta não existe:** ela é criada;
+- **existe e está vazia:** é usada;
+- **existe e tem arquivos:** nada é apagado. O ia-sync só cria `bin/`, `skills/`, `agents/`, `mcp/`, `settings/`, `AGENTS.md`,
+  `_backup/` e `_conflicts/` dentro dela, e usa os que já existirem;
+- **já é uma pasta do ia-sync:** só atualiza o script e a skill. Ao reinstalar, a pasta atual já vem sugerida.
+
+Não dá pra usar a home direto nem uma pasta dentro de `~/.claude`, `~/.codex` etc.
+O comando `ia-sync` acha a pasta escolhida sozinho, sem configurar nada. Neste README, onde estiver `~/.ia`, leia "a sua pasta".
+
+Sem perguntas (scripts/CI): `./install.sh --path ~/dotfiles/ia` ou `./install.sh --yes` (aceita o padrão).
 
 Quer instalar e já sincronizar? Use `./install.sh --run` (ou `curl ... | bash -s -- --run`).
 **Atualizar** é rodar o instalador de novo.
